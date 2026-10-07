@@ -30,6 +30,7 @@ class PaymentSection extends StatelessWidget {
     required this.order,
     required this.myUid,
     required this.payment,
+    this.paymentLoading = false,
     this.loadFailed = false,
   });
 
@@ -38,6 +39,7 @@ class PaymentSection extends StatelessWidget {
 
   /// Null while loading, and while the order is unpaid.
   final Payment? payment;
+  final bool paymentLoading;
   final bool loadFailed;
 
   @override
@@ -47,6 +49,19 @@ class PaymentSection extends StatelessWidget {
 
     if (loadFailed) {
       return const Text('Could not load payment details.');
+    }
+
+    if (paymentLoading) {
+      return const Row(
+        children: [
+          SizedBox.square(
+            dimension: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          SizedBox(width: 10),
+          Text('Checking payment status…'),
+        ],
+      );
     }
 
     final breakdown = repository.breakdownFor(order);

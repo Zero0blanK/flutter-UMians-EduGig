@@ -52,11 +52,9 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
   /// StreamBuilder a new stream object on every rebuild, which tore down and
   /// re-established the Firestore listeners.
   ///
-  /// The payment stream lives here rather than inside the panel so the panel
-  /// and the "Start working" gate share one listener instead of opening two on
-  /// the same document.
+  /// One payment listener updates the screen state, including events that
+  /// arrive before the order has loaded and its payment panel is built.
   late final Stream<WorkOrder> _order;
-  late final Stream<Payment?> _payment;
   Future<AdminAccess?>? _staffAccess;
   String? _accessCheckedFor;
 
@@ -66,25 +64,68 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
   WorkOrder? _latestOrder;
   String? _activeUid;
   StreamSubscription<Payment?>? _paymentWatch;
+  Timer? _paymentLoadTimer;
+  bool _paymentLoading = true;
+  bool _paymentFailed = false;
+  bool _paymentLoadTimedOut = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     final orders = context.read<OrderRepository>();
-    final payments = context.read<PaymentRepository>();
     _order = orders.watchById(widget.orderId);
-    _payment = payments.watchForOrder(widget.orderId);
-    _paymentWatch = _payment.listen(
-      (payment) => _latestPayment = payment,
-      onError: (_) {},
+    _watchPayment();
+  }
+
+  void _watchPayment() {
+    _paymentWatch?.cancel();
+    _paymentLoadTimer?.cancel();
+    _paymentLoading = true;
+    _paymentFailed = false;
+    _paymentLoadTimedOut = false;
+    final paymentStream = context.read<PaymentRepository>().watchForOrder(
+      widget.orderId,
     );
+    _paymentWatch = paymentStream.listen(
+      (payment) {
+        _paymentLoadTimer?.cancel();
+        if (!mounted) return;
+        setState(() {
+          _latestPayment = payment;
+          _paymentLoading = false;
+          _paymentFailed = false;
+          _paymentLoadTimedOut = false;
+        });
+      },
+      onError: (_) {
+        _paymentLoadTimer?.cancel();
+        if (!mounted) return;
+        setState(() {
+          _paymentLoading = false;
+          _paymentFailed = true;
+        });
+      },
+    );
+    _paymentLoadTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted && _paymentLoading) {
+        setState(() {
+          _paymentLoading = false;
+          _paymentLoadTimedOut = true;
+        });
+      }
+    });
+  }
+
+  void _retryPaymentRead() {
+    setState(_watchPayment);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _paymentWatch?.cancel();
+    _paymentLoadTimer?.cancel();
     super.dispose();
   }
 
@@ -173,26 +214,22 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
                   body: const ErrorView(message: 'You cannot view this order.'),
                 );
               }
-              return StreamBuilder<Payment?>(
-                stream: _payment,
-                builder: (context, paymentSnapshot) => _StaffOrderDetail(
-                  order: order,
-                  payment: paymentSnapshot.data,
-                  paymentFailed: paymentSnapshot.hasError,
-                  canReviewChat: access.can(AdminPermission.disputesResolve),
-                ),
+              return _StaffOrderDetail(
+                order: order,
+                payment: _latestPayment,
+                paymentFailed: _paymentFailed || _paymentLoadTimedOut,
+                canReviewChat: access.can(AdminPermission.disputesResolve),
               );
             },
           );
         }
-        return StreamBuilder<Payment?>(
-          stream: _payment,
-          builder: (context, paymentSnapshot) => _OrderDetail(
-            order: order,
-            myUid: uid,
-            payment: paymentSnapshot.data,
-            paymentFailed: paymentSnapshot.hasError,
-          ),
+        return _OrderDetail(
+          order: order,
+          myUid: uid,
+          payment: _latestPayment,
+          paymentLoading: _paymentLoading,
+          paymentFailed: _paymentFailed || _paymentLoadTimedOut,
+          onRetryPayment: _retryPaymentRead,
         );
       },
     );
@@ -321,7 +358,9 @@ class _OrderDetail extends StatelessWidget {
     required this.order,
     required this.myUid,
     required this.payment,
+    required this.paymentLoading,
     required this.paymentFailed,
+    required this.onRetryPayment,
   });
 
   final WorkOrder order;
@@ -330,7 +369,9 @@ class _OrderDetail extends StatelessWidget {
   /// Null while loading and while the order is unpaid; the panel and the work
   /// gate both read this single value.
   final Payment? payment;
+  final bool paymentLoading;
   final bool paymentFailed;
+  final VoidCallback onRetryPayment;
 
   @override
   Widget build(BuildContext context) {
@@ -373,7 +414,13 @@ class _OrderDetail extends StatelessWidget {
             const SizedBox(height: 16),
             _StepTracker(status: order.status),
             const SizedBox(height: 14),
-            _NextStep(order: order, role: role, payment: payment),
+            _NextStep(
+              order: order,
+              role: role,
+              payment: payment,
+              paymentLoading: paymentLoading,
+              paymentFailed: paymentFailed,
+            ),
             const SectionHeader('Terms'),
             _Terms(order: order),
             if (order.isNegotiated) ...[
@@ -393,6 +440,7 @@ class _OrderDetail extends StatelessWidget {
                 order: order,
                 myUid: myUid,
                 payment: payment,
+                paymentLoading: paymentLoading,
                 loadFailed: paymentFailed,
               ),
             ),
@@ -411,6 +459,9 @@ class _OrderDetail extends StatelessWidget {
         order: order,
         myUid: myUid,
         payment: payment,
+        paymentLoading: paymentLoading,
+        paymentFailed: paymentFailed,
+        onRetryPayment: onRetryPayment,
       ),
     );
   }
@@ -450,11 +501,17 @@ class _ActionBar extends StatefulWidget {
     required this.order,
     required this.myUid,
     required this.payment,
+    required this.paymentLoading,
+    required this.paymentFailed,
+    required this.onRetryPayment,
   });
 
   final WorkOrder order;
   final String myUid;
   final Payment? payment;
+  final bool paymentLoading;
+  final bool paymentFailed;
+  final VoidCallback onRetryPayment;
 
   @override
   State<_ActionBar> createState() => _ActionBarState();
@@ -466,6 +523,9 @@ class _ActionBarState extends State<_ActionBar> {
   WorkOrder get order => widget.order;
   String get myUid => widget.myUid;
   Payment? get payment => widget.payment;
+  VoidCallback get onRetryPayment => widget.onRetryPayment;
+  bool get paymentLoading => widget.paymentLoading;
+  bool get paymentFailed => widget.paymentFailed;
 
   Future<void> _run(Future<void> Function() action) async {
     if (_busy) return;
@@ -681,7 +741,12 @@ class _ActionBarState extends State<_ActionBar> {
         final paid = payment?.isSettled ?? false;
         return [
           quiet('Report a problem', _openDispute),
-          if (role == OrderRole.freelancer)
+          if (paymentFailed)
+            OutlinedButton(
+              onPressed: onRetryPayment,
+              child: const Text('Retry payment status'),
+            )
+          else if (role == OrderRole.freelancer)
             FilledButton.icon(
               onPressed: paid && !blocked
                   ? () => _go(OrderStatus.inProgress)
@@ -694,6 +759,8 @@ class _ActionBarState extends State<_ActionBar> {
             // payment panel says where it stands and what to do; the bar
             // must not start a second payment.
             const SizedBox.shrink()
+          else if (paymentLoading)
+            const Text('Checking payment status…')
           else
             primary(
               'Pay ₱${NumberFormat.decimalPattern().format(order.price)}',
@@ -992,11 +1059,15 @@ class _NextStep extends StatelessWidget {
     required this.order,
     required this.role,
     required this.payment,
+    required this.paymentLoading,
+    required this.paymentFailed,
   });
 
   final WorkOrder order;
   final OrderRole role;
   final Payment? payment;
+  final bool paymentLoading;
+  final bool paymentFailed;
 
   @override
   Widget build(BuildContext context) {
@@ -1007,6 +1078,32 @@ class _NextStep extends StatelessWidget {
     final pendingPayment = payment?.status == PaymentStatus.pending;
     final gateway = payment?.method == PaymentMethod.xendit;
     final when = DateFormat.yMMMd().add_jm();
+
+    if (payment == null && (paymentLoading || paymentFailed)) {
+      final tint = paymentLoading ? scheme.outline : scheme.error;
+      return LilyPanel(
+        tint: tint,
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        child: Row(
+          children: [
+            Icon(
+              paymentLoading
+                  ? Icons.hourglass_top_rounded
+                  : Icons.error_outline_rounded,
+              size: 20,
+              color: tint,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                paymentLoading ? 'Checking payment status…' : 'Payment status is taking longer than expected. Retry below.',
+                style: theme.textTheme.bodyMedium,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
 
     final (String text, IconData icon, Color tint) = switch (order.status) {
       OrderStatus.pending =>
