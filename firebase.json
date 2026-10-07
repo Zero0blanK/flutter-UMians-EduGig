@@ -1,0 +1,80 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "hosting": {
+    "public": "build/web",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  },
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "student-freelance-services",
+          "appId": "1:933240164340:android:a8ab2785ce234fef1773a1",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "student-freelance-services",
+          "configurations": {
+            "android": "1:933240164340:android:a8ab2785ce234fef1773a1",
+            "ios": "1:933240164340:ios:cbdbcd205c04db291773a1",
+            "macos": "1:933240164340:ios:cbdbcd205c04db291773a1",
+            "web": "1:933240164340:web:09429198ce30e95b1773a1",
+            "windows": "1:933240164340:web:282f44ccd9d58e821773a1"
+          }
+        }
+      }
+    }
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "ui": {
+      "enabled": true,
+      "port": 4000
+    },
+    "singleProjectMode": true,
+    "functions": {
+      "port": 5001
+    },
+    "storage": {
+      "port": 9199
+    }
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "runtime": "nodejs20",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "*.test.js",
+        "test-helpers.js",
+        ".env.example",
+        "README.md"
+      ]
+    }
+  ]
+}

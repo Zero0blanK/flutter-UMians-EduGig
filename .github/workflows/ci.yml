@@ -1,0 +1,68 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Flutter stable
+        run: |
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - name: Get packages
+        run: flutter pub get
+      - name: Check formatting and analysis
+        run: |
+          dart format --output=none --set-exit-if-changed lib test
+          flutter analyze
+      - name: Run Dart tests
+        run: flutter test
+
+  functions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+      - name: Install backend packages
+        run: npm ci
+        working-directory: functions
+      - name: Run backend tests
+        run: npm test
+        working-directory: functions
+
+  firestore-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: rules-tests/package-lock.json
+      - name: Install rules-test packages
+        run: npm ci
+        working-directory: rules-tests
+      - name: Run rules tests against disposable emulators
+        run: npx --yes firebase-tools@latest emulators:exec --only auth,firestore,storage --project demo-chat-storage "npm --prefix rules-tests test && npm --prefix rules-tests run test:storage"
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reject Firebase service-account keys
+        run: |
+          if git grep -I -l -E '"private_key"[[:space:]]*:' -- .; then
+            echo "A service-account private key was found in tracked source."
+            exit 1
+          fi

@@ -1,0 +1,97 @@
+rules_version = '2';
+
+// Student Freelance Services — Cloud Storage rules.
+//
+// Every path carries its own authorisation question: a file lives under the
+// conversation, order, or user it belongs to, and the rule asks Firestore
+// whether the caller is entitled to that parent. Sizes are capped here
+// because request.resource.size is the one limit a user cannot bypass.
+//
+// Nothing is deletable from a client. Chat and delivery files are evidence
+// in a dispute; a verification ID is replaced by uploading another.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Same identity boundary as firestore.rules: a verified UM account.
+    function isSignedIn() {
+      return request.auth != null
+        && request.auth.token.get('email_verified', false) == true
+        && request.auth.token.get('email', '').lower()
+             .matches('.*@umindanao[.]edu[.]ph');
+    }
+
+    // Staff carry a role and a permission list in admins/{uid}; the main
+    // admin has every permission. Mirrors can() in firestore.rules.
+    function isAdmin() {
+      return isSignedIn()
+        && firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid));
+    }
+
+    function can(permission) {
+      return isAdmin()
+        && (firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.get('role', 'staff') == 'admin'
+            || permission in firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.get('permissions', []));
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    // Chat: videos up to 25 MB; images and other files up to 10 MB.
+    match /conversations/{conversationId}/{fileName} {
+      function isParticipant() {
+        return isSignedIn()
+          && request.auth.uid in firestore.get(
+               /databases/(default)/documents/conversations/$(conversationId)
+             ).data.participantIds;
+      }
+      allow read: if isParticipant() || can('disputes.resolve');
+      allow create: if isParticipant()
+        // Uploads must never replace evidence already referenced by a message.
+        && resource == null
+        && request.resource.size > 0
+        && request.resource.size <=
+          (request.resource.contentType in ['video/mp4', 'video/quicktime', 'video/webm']
+            ? 25 : 10) * 1024 * 1024;
+      allow update, delete: if false;
+    }
+
+    // Delivered work: the freelancer uploads, both parties download. 25 MB
+    // because a poster or an edited clip is larger than a chat photo.
+    match /orders/{orderId}/deliveries/{fileName} {
+      function order() {
+        return firestore.get(/databases/(default)/documents/orders/$(orderId)).data;
+      }
+      allow read: if can('disputes.resolve')
+        || (isSignedIn() && request.auth.uid in order().participantIds);
+      allow create: if isSignedIn()
+        && request.auth.uid == order().freelancerId
+        && request.resource.size <= 25 * 1024 * 1024;
+      allow update, delete: if false;
+    }
+
+    // Student ID for the verified badge: the owner uploads, only staff and
+    // the owner can ever see it.
+    match /verification/{uid}/{fileName} {
+      allow read: if can('verification.decide') || (isSignedIn() && request.auth.uid == uid);
+      allow create: if isSignedIn()
+        && request.auth.uid == uid
+        && isImage()
+        && request.resource.size <= 5 * 1024 * 1024;
+      allow update, delete: if false;
+    }
+
+    // Profile photo: public to signed-in users, like the profile itself.
+    match /users/{uid}/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn()
+        && request.auth.uid == uid
+        && isImage()
+        && request.resource.size <= 2 * 1024 * 1024;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

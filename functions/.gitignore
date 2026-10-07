@@ -1,0 +1,6 @@
+node_modules/
+# .env holds only non-secret URLs and is tracked so every deploy has it.
+# Secrets go through `firebase functions:secrets:set`, never a file.
+.env.local
+.env.*.local
+*.log

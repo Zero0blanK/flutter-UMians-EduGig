@@ -1,0 +1,14 @@
+{
+  "name": "student-freelance-seed",
+  "description": "Demo data seeder for screenshots, demos, and realistic UI testing",
+  "private": true,
+  "scripts": {
+    "seed": "node seed.js",
+    "reseed": "node seed.js --wipe",
+    "seed:live": "node seed.js --live",
+    "grant-admin": "node seed.js --admin"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.3.0"
+  }
+}

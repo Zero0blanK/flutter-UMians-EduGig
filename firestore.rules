@@ -1,0 +1,1337 @@
+rules_version = '2';
+
+// Student Freelance Services — Firestore security rules.
+//
+// This file IS the authorization layer. Client-side checks are UX only.
+// Layout mirrors lib/core/constants/firestore_paths.dart.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // The only identity the platform accepts is a verified University of
+    // Mindanao Google account. Every other rule builds on this one, so a
+    // personal Gmail that somehow completed sign-in can read and write
+    // nothing. Mirrors UmAccount in the app and the backend's token check.
+    function isSignedIn() {
+      return request.auth != null
+        && request.auth.token.get('email_verified', false) == true
+        && request.auth.token.get('email', '').lower()
+             .matches('.*@umindanao[.]edu[.]ph');
+    }
+
+    // Student addresses are first-initial.surname.123456; faculty and office
+    // accounts on the same domain are UM accounts but not students.
+    function isStudentEmail() {
+      return request.auth.token.get('email', '').lower()
+        .matches('[a-z]+[.][a-z]+[.][0-9]{6}@umindanao[.]edu[.]ph');
+    }
+
+    // Staff may suspend an account (users.manage). A suspended student can
+    // still sign in and read, but creates nothing and moves nothing.
+    // A profile can be missing for a moment after first sign-in (the write
+    // failed, or is offline); that must not lock the student out of chat,
+    // which is where they would go to ask for help.
+    function isActive() {
+      return isSignedIn()
+        && (!exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            || get(/databases/$(database)/documents/users/$(request.auth.uid))
+                 .data.get('suspended', false) == false);
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Staff access is the existence of admins/{uid}, which carries a role and
+    // a permission list. The main admin (role 'admin') holds every permission
+    // and is written only by a service-account key; staff (role 'staff') are
+    // granted specific permissions by the main admin. Each staff surface asks
+    // for the one permission it needs, so a listing moderator cannot settle
+    // a payout by typing a path.
+    function staffDoc() {
+      return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isMainAdmin() {
+      return isAdmin() && staffDoc().get('role', 'staff') == 'admin';
+    }
+
+    function can(permission) {
+      return isAdmin()
+        && (staffDoc().get('role', 'staff') == 'admin'
+            || permission in staffDoc().get('permissions', []));
+    }
+
+    // Mirrors AdminPermission in lib/features/admin/domain/admin_access.dart
+    // and PERMISSIONS in functions/policy.js.
+    function knownPermissions() {
+      return [
+        'users.manage', 'services.moderate', 'categories.manage',
+        'orders.manage', 'disputes.resolve', 'payouts.settle',
+        'refunds.handle', 'verification.decide', 'reports.view',
+        'settings.manage'
+      ];
+    }
+
+    // Selling needs an adult: a minor cannot enter a contract or hold a
+    // verified e-wallet for payouts. Buying is open to any signed-in student.
+    // 6570 days is 18 years; the check must be opted into with a birth date,
+    // never defaulted through. Mirrors isAdult() in functions/policy.js.
+    function isAdult() {
+      let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return profile.get('birthDate', null) != null
+        && profile.birthDate is timestamp
+        && profile.birthDate <= request.time - duration.value(6570, 'd');
+    }
+
+    // ------------------------------------------------------------------
+    // admins/{uid} - staff roster
+    // ------------------------------------------------------------------
+    match /admins/{uid} {
+      function validStaff() {
+        return request.resource.data.keys().hasOnly([
+            'role', 'permissions', 'displayName', 'email', 'note',
+            'createdAt', 'createdBy', 'updatedAt'
+          ])
+          // Only a service-account key makes a main admin.
+          && request.resource.data.role == 'staff'
+          && request.resource.data.permissions is list
+          && request.resource.data.permissions.size() <= 10
+          && knownPermissions().hasAll(request.resource.data.permissions)
+          && request.resource.data.createdBy == request.auth.uid;
+      }
+      // Anyone can read their own access; the roster is the main admin's.
+      allow get: if isSelf(uid) || isMainAdmin();
+      allow list: if isMainAdmin();
+      // The main admin grants, changes and revokes staff, never themselves.
+      allow create, update: if isMainAdmin() && uid != request.auth.uid
+        && validStaff()
+        && (resource == null || resource.data.get('role', 'staff') == 'staff');
+      allow delete: if isMainAdmin() && uid != request.auth.uid
+        && resource.data.get('role', 'staff') == 'staff';
+    }
+
+    // ------------------------------------------------------------------
+    // users/{uid} + subcollections
+    // ------------------------------------------------------------------
+    match /users/{userId} {
+      // Profiles are public to signed-in users (needed for conversation
+      // headers and seller info). Only the owner can create/update, and
+      // immutable fields cannot change after creation.
+      // proUntil and identityVerified are SERVER-OWNED: the backend sets them
+      // after a paid Pro month and a staff identity check. A client may carry
+      // them through unchanged but never introduce or alter them — otherwise
+      // the verified badge would be self-granted the moment someone edited
+      // their profile.
+      // identityVerified may be claimed at creation only when the signed-in
+      // address is a student address: the institutional sign-in is the
+      // check. Afterwards only staff (through the backend) move it.
+      function serverFieldsUntouched() {
+        return request.resource.data.get('publicRole', null)
+                 == (resource == null ? null : resource.data.get('publicRole', null))
+          && request.resource.data.get('proUntil', null)
+                 == (resource == null ? null : resource.data.get('proUntil', null))
+          && request.resource.data.get('suspended', false)
+                 == (resource == null ? false : resource.data.get('suspended', false))
+          && (resource == null
+              ? (request.resource.data.get('identityVerified', false) == false
+                 || isStudentEmail())
+              : request.resource.data.get('identityVerified', false)
+                  == resource.data.get('identityVerified', false));
+      }
+
+      // The address and student number on a profile are what the token says
+      // they are, at creation, and never change afterwards.
+      function validIdentity() {
+        return (!('email' in request.resource.data.keys())
+                || request.resource.data.email == request.auth.token.email)
+          && (!('studentId' in request.resource.data.keys())
+                || (request.resource.data.studentId is string
+                    && request.auth.token.email.lower().matches(
+                         '[a-z]+[.][a-z]+[.]' + request.resource.data.studentId
+                         + '@umindanao[.]edu[.]ph')))
+          && (resource == null
+              || (request.resource.data.get('email', null) == resource.data.get('email', null)
+                  && request.resource.data.get('studentId', null) == resource.data.get('studentId', null)));
+      }
+
+      // A birth date is set once and never changed from a client: it gates
+      // selling and payouts, so editing it after the fact would be the
+      // same as no gate. Must be a plausible date (13 to 100 years ago).
+      function validBirthDate() {
+        return !('birthDate' in request.resource.data.keys())
+          || (request.resource.data.birthDate is timestamp
+              && request.resource.data.birthDate <= request.time - duration.value(4745, 'd')
+              && request.resource.data.birthDate >= request.time - duration.value(36500, 'd')
+              && (resource == null
+                  || resource.data.get('birthDate', null) == null
+                  || request.resource.data.birthDate == resource.data.birthDate));
+      }
+
+      function validProfile() {
+        return request.resource.data.keys().hasOnly([
+          'uid', 'displayName', 'bio', 'skills', 'photoUrl',
+          'collegeId', 'program', 'birthDate', 'paymentTermsAcceptedAt',
+          'email', 'studentId', 'suspended',
+          'createdAt', 'updatedAt', 'proUntil', 'identityVerified', 'onboardingComplete', 'publicRole'
+        ])
+        && serverFieldsUntouched()
+        && (resource == null
+            ? request.resource.data.get('onboardingComplete', false) == false
+            : request.resource.data.get('onboardingComplete', true)
+                == resource.data.get('onboardingComplete', true)
+                || (!resource.data.get('onboardingComplete', true)
+                    && request.resource.data.get('onboardingComplete', false) == true
+                    && request.resource.data.get('collegeId', '') is string
+                    && request.resource.data.get('program', '') is string))
+        && validIdentity()
+        && validBirthDate()
+        && (!('paymentTermsAcceptedAt' in request.resource.data.keys())
+            || request.resource.data.paymentTermsAcceptedAt is timestamp)
+        && (!('photoUrl' in request.resource.data.keys())
+            || request.resource.data.photoUrl == null
+            || (request.resource.data.photoUrl is string
+                && request.resource.data.photoUrl.size() <= 2048))
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() > 0
+        && request.resource.data.displayName.size() <= 60
+        // Bio and skills were unbounded here: the 500-character limit in the
+        // edit dialog is UX, and a crafted write could store an arbitrarily
+        // large profile document that every viewer then pays to read.
+        && (!('bio' in request.resource.data.keys())
+            || (request.resource.data.bio is string
+                && request.resource.data.bio.size() <= 500))
+        && (!('skills' in request.resource.data.keys())
+            || (request.resource.data.skills is list
+                && request.resource.data.skills.size() <= 20))
+        // College is a closed set, mirrored from lib/core/constants/academics.
+        // Free text here would leave the same college spelled six ways and
+        // unqueryable.
+        && (!('collegeId' in request.resource.data.keys())
+            || request.resource.data.collegeId in [
+                 'cce', 'case', 'cbae', 'cae', 'cee', 'cte', 'chse'
+               ])
+        // Programme lists change often enough that pinning every degree name
+        // in rules would mean a deploy per curriculum change; bound it instead.
+        && (!('program' in request.resource.data.keys())
+            || (request.resource.data.program is string
+                && request.resource.data.program.size() <= 80));
+      }
+      allow get: if isSignedIn();
+      // No directory scraping for ordinary users; staff who manage users or
+      // read reports need the roster.
+      // Listing moderators need the seller directory to open a student's
+      // staff profile and review that student's listings in context.
+      allow list: if can('users.manage') || can('services.moderate')
+        || can('reports.view');
+      // Suspension is the one thing staff may change on a profile.
+      allow update: if can('users.manage')
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['suspended', 'updatedAt'])
+        && request.resource.data.suspended is bool;
+      // createdAt is required at creation for the same reason as on
+      // conversations: the update rule pins it, so a profile without one
+      // could never be edited again.
+      allow create: if isSelf(userId) && validProfile()
+        && 'createdAt' in request.resource.data.keys();
+      allow update: if isSelf(userId) && validProfile()
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+
+      // Per-device FCM tokens. The document id is the token itself, so a
+      // device re-registering overwrites rather than duplicates. Only the
+      // owner may see or change their devices; the push function reads them
+      // with the Admin SDK.
+      match /devices/{deviceId} {
+        allow read: if isSelf(userId);
+        allow create, update: if isSelf(userId)
+          && request.resource.data.keys().hasOnly(['token', 'platform', 'updatedAt'])
+          && request.resource.data.token is string
+          && request.resource.data.token.size() > 0
+          && request.resource.data.token.size() <= 512
+          && request.resource.data.platform in ['android', 'ios', 'web', 'macos'];
+        allow delete: if isSelf(userId);
+      }
+
+      // Notifications are written by the ACTING CLIENT (no Cloud Functions on
+      // the free tier) and validated strictly per type: the sender must be a
+      // conversation participant, an order participant, or the client of the
+      // completed order being reviewed. Recipients can only flip `read`.
+      match /notifications/{notificationId} {
+        function validNotification() {
+          return request.resource.data.keys().hasOnly([
+            'type', 'title', 'body', 'read', 'createdAt', 'expiresAt',
+            'conversationId', 'orderId'
+          ])
+          && request.resource.data.type in [
+            'chat.message', 'offer.received', 'offer.accepted', 'offer.declined',
+            'order.created', 'order.accepted', 'order.rejected',
+            'order.started', 'order.submitted', 'order.revision_requested',
+            'order.completed', 'order.cancelled',
+            'payment.confirmed',
+            'review.received'
+          ]
+          && request.resource.data.title is string
+          && request.resource.data.title.size() > 0
+          && request.resource.data.title.size() <= 140
+          && request.resource.data.body == ''
+          && request.resource.data.read == false
+          && (
+            // chat.message and offer.*: both sender and recipient in the
+            // conversation.
+            (request.resource.data.type in ['chat.message', 'offer.received',
+                                            'offer.accepted', 'offer.declined']
+              && 'conversationId' in request.resource.data
+              && isSignedIn()
+              && request.auth.uid in get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data.participantIds
+              && userId in get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data.participantIds)
+            ||
+            // order.*: both parties belong to the referenced order.
+            (request.resource.data.type.matches('order\\..*')
+              && 'orderId' in request.resource.data
+              && isSignedIn()
+              && request.auth.uid in get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.participantIds
+              && userId in get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.participantIds)
+            ||
+            // payment.confirmed: only the freelancer who received the money
+            // may tell the buyer it landed.
+            (request.resource.data.type == 'payment.confirmed'
+              && 'orderId' in request.resource.data
+              && isSignedIn()
+              && request.auth.uid == get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.freelancerId
+              && userId == get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.clientId)
+            ||
+            // review.received: only the buyer of a completed order may notify
+            // its seller.
+            (request.resource.data.type == 'review.received'
+              && 'orderId' in request.resource.data
+              && isSignedIn()
+              && userId == get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.freelancerId
+              && request.auth.uid == get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.clientId
+              && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status == 'completed')
+          );
+        }
+
+        allow read: if isSelf(userId);
+        allow create: if isSignedIn() && validNotification();
+        allow delete: if false;
+        allow update: if isSelf(userId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // services/{serviceId}
+    // ------------------------------------------------------------------
+    match /services/{serviceId} {
+      function isSeller() {
+        return isSignedIn() && resource.data.sellerId == request.auth.uid;
+      }
+
+      function validService() {
+        return request.resource.data.keys().hasAll([
+          'sellerId', 'title', 'titleLower', 'description', 'categoryId',
+          'startingPrice', 'currency', 'deliveryDays', 'revisionCount',
+          'status', 'ratingSum', 'ratingCount'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'sellerId', 'title', 'titleLower', 'description', 'categoryId',
+          'skills', 'keywords', 'startingPrice', 'currency', 'deliveryDays',
+          'revisionCount', 'status', 'pricingMode', 'requiresContact',
+          'ratingSum', 'ratingCount',
+          'lastReviewId', 'featuredUntil', 'createdAt', 'updatedAt'
+        ])
+        // featuredUntil is set by the backend for paying Pro sellers and
+        // carried through unchanged by the seller's own edits.
+        && request.resource.data.get('featuredUntil', null)
+             == (resource == null ? null : resource.data.get('featuredUntil', null))
+        && request.resource.data.sellerId == request.auth.uid
+        // titleLower drives prefix search and was maintained by hand; a drifted
+        // value silently makes a service unfindable.
+        && request.resource.data.titleLower == request.resource.data.title.lower()
+        && request.resource.data.ratingSum is int
+        && request.resource.data.ratingSum >= 0
+        && request.resource.data.ratingCount is int
+        && request.resource.data.ratingCount >= 0
+        && (!('keywords' in request.resource.data.keys())
+            || (request.resource.data.keywords is list
+                && request.resource.data.keywords.size() <= 40))
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 80
+        && request.resource.data.description is string
+        && request.resource.data.description.size() >= 20
+        && request.resource.data.description.size() <= 4000
+        && request.resource.data.startingPrice is int
+        && request.resource.data.startingPrice >= 1
+        && request.resource.data.startingPrice <= 1000000
+        && request.resource.data.deliveryDays is int
+        && request.resource.data.deliveryDays >= 1
+        && request.resource.data.deliveryDays <= 90
+        && request.resource.data.revisionCount is int
+        && request.resource.data.revisionCount >= 0
+        && request.resource.data.revisionCount <= 10
+        // The editor always writes these, and direct-order rules depend on
+        // them. Keeping the wire values closed prevents a client from
+        // inventing a pricing model that checkout does not understand.
+        && request.resource.data.get('pricingMode', 'fixed')
+             in ['fixed', 'negotiable']
+        && request.resource.data.get('requiresContact', false) is bool
+        && request.resource.data.status in ['draft', 'published', 'paused', 'archived'];
+      }
+
+      function validRatingBump(sid) {
+        let rid = request.resource.data.lastReviewId;
+        let review = /databases/$(database)/documents/reviews/$(rid);
+        return request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['ratingSum', 'ratingCount', 'lastReviewId'])
+          && rid is string
+          && !exists(review)
+           && existsAfter(review)
+           && getAfter(review).data.serviceId == sid
+           && getAfter(review).data.reviewerId == request.auth.uid
+           && getAfter(review).data.revieweeId == resource.data.sellerId
+          && request.resource.data.ratingCount == resource.data.ratingCount + 1
+          && request.resource.data.ratingSum
+             == resource.data.ratingSum + getAfter(review).data.rating;
+      }
+
+      // Public marketplace reads see published services only; the seller can
+      // always read their own drafts.
+      allow get: if isSignedIn() && (resource.data.status == 'published' || resource.data.sellerId == request.auth.uid);
+      allow list: if isSignedIn() && resource.data.status == 'published';
+      allow list: if isSignedIn() && resource.data.sellerId == request.auth.uid;
+      // Staff see every listing, including drafts and archived ones, because
+      // a moderation queue that only shows published work is no queue at all.
+      allow get, list: if can('services.moderate') || can('reports.view');
+
+      // A new listing starts unrated; only the counter path below may move it.
+      // Only adults sell (see isAdult).
+      allow create: if isActive() && validService() && isAdult()
+        && request.resource.data.ratingSum == 0
+        && request.resource.data.ratingCount == 0;
+      // The seller cannot transfer ownership. validService() is applied on
+      // update as well as create: on an update request.resource.data is the
+      // merged result, so partial writes still have to leave a document that
+      // satisfies every bound. Without this an owner could push their own
+      // price or title outside the limits, or graft on unlisted fields such
+      // as a forged ratingSum. Ratings themselves are never stored here —
+      // they are derived from immutable review documents by aggregate query.
+      allow update: if isSeller()
+        // Suspended means off the market: no edits, no republishing. The
+        // create rule already says so; without it here a suspended seller
+        // simply flipped an old draft live.
+        && isActive()
+        && validService()
+        && request.resource.data.sellerId == resource.data.sellerId
+        && request.resource.data.createdAt == resource.data.createdAt
+        // A seller must never move their own score.
+        && request.resource.data.ratingSum == resource.data.ratingSum
+        && request.resource.data.ratingCount == resource.data.ratingCount
+        // Publishing (from any other state) is the moment a listing goes on
+        // sale, so the age check applies there too, not only at creation.
+        && (request.resource.data.status != 'published'
+            || resource.data.status == 'published'
+            || isAdult());
+
+      // Moderation. Staff can pull a listing out of the marketplace but can
+      // never edit its content, price or score — taking something down is a
+      // different power from rewriting it.
+      allow update: if can('services.moderate')
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt'])
+        && request.resource.data.status in ['paused', 'archived'];
+
+      // Denormalised rating counters, maintained without a trusted server.
+      //
+      // The reviewer bumps the counters in the SAME atomic write that creates
+      // the review, and the rule binds the two together: getAfter() reads the
+      // review as it will exist after this commit, so the increment must match
+      // the rating actually being written. exists()/existsAfter() prove the
+      // review is being created right now rather than replayed, which is what
+      // stops someone bumping the same service repeatedly off one old review.
+      //
+      // This is why counters can live here at all — the project note that
+      // denormalised totals need Cloud Functions is not the case.
+      allow update: if isSignedIn() && validRatingBump(serviceId);
+      allow delete: if isSeller();
+    }
+
+    // ------------------------------------------------------------------
+    // orders/{orderId}
+    // ------------------------------------------------------------------
+    match /orders/{orderId} {
+      function isParticipant() {
+        return isSignedIn()
+          && request.auth.uid in resource.data.participantIds;
+      }
+
+      // Price/participants/status integrity is enforced by restricting which
+      // fields each update may touch. Creation values are validated against
+      // the live service document via get() lookups below.
+      function validOrderCreate() {
+        return request.resource.data.keys().hasOnly([
+          'serviceId', 'serviceTitle', 'clientId', 'freelancerId',
+          'participantIds', 'price', 'currency', 'deliveryDays',
+          'revisionCount', 'requirements', 'status', 'createdAt',
+          'updatedAt', 'offerId', 'scope'
+        ])
+        && request.resource.data.keys().hasAll([
+          'serviceId', 'serviceTitle', 'clientId', 'freelancerId',
+          'participantIds', 'price', 'currency', 'deliveryDays',
+          'revisionCount', 'requirements', 'status'
+         ])
+         && request.resource.data.clientId == request.auth.uid
+         && request.resource.data.clientId is string
+         && request.resource.data.freelancerId is string
+         && request.resource.data.clientId != request.resource.data.freelancerId
+         && request.resource.data.participantIds is list
+         && request.resource.data.participantIds.size() == 2
+         && request.resource.data.participantIds.hasAll([
+             request.resource.data.clientId,
+             request.resource.data.freelancerId
+           ])
+        && request.resource.data.price is int
+        && request.resource.data.price >= 1
+        && request.resource.data.requirements is string
+        && request.resource.data.requirements.size() >= 10
+        && request.resource.data.requirements.size() <= 4000
+        && request.resource.data.status == 'pending';
+      }
+
+      allow get: if isParticipant();
+      allow list: if isSignedIn() && request.auth.uid in resource.data.participantIds;
+      allow get, list: if can('orders.manage') || can('disputes.resolve') || can('reports.view');
+
+      function orderedService() {
+        return get(/databases/$(database)/documents/services/$(request.resource.data.serviceId)).data;
+      }
+
+      // A direct order: the listing is fixed-price, its seller allows
+      // ordering without a conversation, and the price is the listed price.
+      // A negotiable listing, or one whose seller asked to be contacted
+      // first, can never be ordered this way — the price on it is not the
+      // price.
+      function directOrder() {
+        return !('offerId' in request.resource.data.keys())
+          && orderedService().get('pricingMode', 'fixed') == 'fixed'
+           && orderedService().get('requiresContact', false) == false
+           && orderedService().startingPrice == request.resource.data.price
+           && orderedService().title == request.resource.data.serviceTitle
+           && orderedService().currency == request.resource.data.currency
+           && orderedService().deliveryDays == request.resource.data.deliveryDays
+           && orderedService().revisionCount == request.resource.data.revisionCount
+           && orderedService().sellerId == request.resource.data.freelancerId
+          && orderedService().status == 'published';
+      }
+
+      // An order from an offer: every negotiated figure is copied from the
+      // offer the client accepted, and the same batch marks the offer
+      // `ordered` (see offers/{id}), so one offer yields exactly one order.
+      function offer() {
+        return get(/databases/$(database)/documents/offers/$(request.resource.data.offerId)).data;
+      }
+
+      function offerOrder() {
+        return 'offerId' in request.resource.data.keys()
+          && request.resource.data.offerId is string
+          && offer().status == 'accepted'
+          && offer().clientId == request.auth.uid
+           && offer().freelancerId == request.resource.data.freelancerId
+           && offer().serviceId == request.resource.data.serviceId
+           && offer().serviceTitle == request.resource.data.serviceTitle
+           && offer().price == request.resource.data.price
+          && offer().deliveryDays == request.resource.data.deliveryDays
+          && offer().revisionCount == request.resource.data.revisionCount
+           && request.resource.data.get('scope', '') == offer().scope
+           && request.resource.data.currency == 'PHP'
+          && getAfter(/databases/$(database)/documents/offers/$(request.resource.data.offerId)).data.status == 'ordered'
+          && getAfter(/databases/$(database)/documents/offers/$(request.resource.data.offerId)).data.orderId == orderId
+          && orderedService().sellerId == request.resource.data.freelancerId
+          && orderedService().status == 'published';
+      }
+
+      // Staff can pause ordering platform-wide (settings/platform); existing
+      // orders keep moving, new ones wait.
+      function ordersOpen() {
+        return !exists(/databases/$(database)/documents/settings/platform)
+          || get(/databases/$(database)/documents/settings/platform).data.get('ordersPaused', false) == false;
+      }
+
+      allow create: if isActive() && ordersOpen() && validOrderCreate()
+        && (directOrder() || offerOrder());
+
+      // Updates may only change status/deadline/updatedAt; participants,
+      // price, requirements and review flag are frozen. Status transitions
+      // follow the state machine mirrored from
+      // lib/features/orders/domain/order_transitions.dart.
+      allow update: if isParticipant()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+             'status', 'deadline', 'updatedAt', 'disputeReason'
+           ])
+        && (
+          (request.resource.data.status == 'disputed'
+            && !('disputeReason' in resource.data.keys())
+            && request.resource.data.disputeReason is string
+            && request.resource.data.disputeReason.size() >= 10
+            && request.resource.data.disputeReason.size() <= 1000)
+          ||
+          (request.resource.data.status != 'disputed'
+            && request.resource.data.get('disputeReason', null)
+                 == resource.data.get('disputeReason', null))
+        )
+        && (request.resource.data.status != 'inProgress'
+          || (exists(/databases/$(database)/documents/payments/$(orderId))
+              && get(/databases/$(database)/documents/payments/$(orderId)).data.status == 'paid'))
+        // A suspended student can still get out of an order (decline,
+        // cancel, or hand it to staff) but cannot carry one forward:
+        // accepting, starting, delivering or completing is selling and buying.
+        && (isActive()
+            || request.resource.data.status in ['rejected', 'cancelled', 'disputed'])
+        && (
+          // pending -> accepted | rejected (freelancer)
+          (resource.data.status == 'pending'
+            && request.resource.data.status in ['accepted', 'rejected']
+            && request.auth.uid == resource.data.freelancerId)
+          ||
+          // pending -> cancelled (client)
+          (resource.data.status == 'pending'
+            && request.resource.data.status == 'cancelled'
+            && request.auth.uid == resource.data.clientId)
+          ||
+          // accepted -> in_progress (freelancer)
+          (resource.data.status == 'accepted'
+            && request.resource.data.status == 'inProgress'
+            && request.auth.uid == resource.data.freelancerId)
+          ||
+          // accepted/inProgress -> cancelled | disputed
+          (resource.data.status in ['accepted', 'inProgress']
+            && request.resource.data.status in ['cancelled', 'disputed'])
+          ||
+          // inProgress -> submitted (freelancer)
+          (resource.data.status == 'inProgress'
+            && request.resource.data.status == 'submitted'
+            && request.auth.uid == resource.data.freelancerId)
+          ||
+          // submitted -> completed | revision_requested (client)
+          (resource.data.status == 'submitted'
+            && request.resource.data.status in ['completed', 'revisionRequested']
+            && request.auth.uid == resource.data.clientId)
+          ||
+          // revisionRequested -> submitted (freelancer redelivery)
+          (resource.data.status == 'revisionRequested'
+            && request.resource.data.status == 'submitted'
+            && request.auth.uid == resource.data.freelancerId)
+        );
+
+      // A disputed order is terminal for both parties by design, which means
+      // only staff can unstick it. They may close it as completed or
+      // cancelled, and nothing else: price, participants and history stay
+      // frozen exactly as they are for everyone else.
+      //
+      // Above DISPUTE_SECOND_OPINION_FROM pesos (functions/policy.js,
+      // DisputePolicy in Dart) one person cannot decide alone: a staff
+      // member records a proposal, and a different staff member closes the
+      // order with the same outcome. Below it a single decision stands.
+      function disputeOutcomes() { return ['completed', 'cancelled']; }
+      function proposal() { return request.resource.data.disputeResolution; }
+      function proposedByAnotherStaff() {
+        return 'disputeResolution' in resource.data
+          && resource.data.disputeResolution.outcome == request.resource.data.status
+          && resource.data.disputeResolution.proposedBy != request.auth.uid;
+      }
+      allow update: if can('disputes.resolve')
+        && resource.data.status == 'disputed'
+        && (
+          // Propose (or replace one's own proposal). Never moves the status.
+          (request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['disputeResolution', 'updatedAt'])
+            && proposal() is map
+            && proposal().keys().hasOnly(['outcome', 'proposedBy', 'proposedAt'])
+            && proposal().outcome in disputeOutcomes()
+            && proposal().proposedBy == request.auth.uid
+            && proposal().proposedAt == request.time)
+          ||
+          // Close.
+          (request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['status', 'updatedAt'])
+            && request.resource.data.status in disputeOutcomes()
+            && (resource.data.price < 2000 || proposedByAnotherStaff()))
+        );
+
+      allow delete: if false;
+
+      // Delivery records: the freelancer submits a text note describing the
+      // delivered work. Only the order's freelancer may create deliveries.
+      match /deliveries/{deliveryId} {
+        function orderDoc() {
+          return get(/databases/$(database)/documents/orders/$(orderId)).data;
+        }
+
+        // One delivery file: a Cloud Storage download URL and the metadata
+        // the chip shows. Rules cannot loop, so the five slots are checked
+        // one by one below.
+        function validFile(file) {
+          return file is map
+            && file.keys().hasOnly(['url', 'name', 'size', 'type'])
+            && file.url is string
+            && file.url.size() <= 2048
+            && file.url.matches('https://firebasestorage[.]googleapis[.]com/v0/b/.*')
+            && file.name is string
+            && file.name.size() > 0
+            && file.name.size() <= 200
+            && file.size is int
+            && file.size >= 0
+            && file.type in ['image', 'file'];
+        }
+
+        function validFiles() {
+          let files = request.resource.data.attachments;
+          return files is list
+            && files.size() <= 5
+            && (files.size() < 1 || validFile(files[0]))
+            && (files.size() < 2 || validFile(files[1]))
+            && (files.size() < 3 || validFile(files[2]))
+            && (files.size() < 4 || validFile(files[3]))
+            && (files.size() < 5 || validFile(files[4]));
+        }
+
+        function validDelivery() {
+          return request.resource.data.keys().hasOnly([
+            'senderId', 'note', 'attachments', 'createdAt'
+          ])
+            && request.resource.data.senderId == request.auth.uid
+            && request.auth.uid == orderDoc().freelancerId
+            && request.resource.data.note is string
+            && request.resource.data.note.size() > 0
+            && request.resource.data.note.size() <= 2000
+            // Files live in Storage under orders/{orderId}/deliveries/; the
+            // record carries their URLs. Bounded so a delivery cannot become
+            // a document every viewer pays to download.
+            && (!('attachments' in request.resource.data.keys()) || validFiles());
+        }
+
+        allow read: if isSignedIn()
+          && request.auth.uid in orderDoc().participantIds;
+        allow create: if validDelivery();
+        allow update, delete: if false;
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // offers/{id} - negotiated quotes, sent in chat, ordered once
+    // ------------------------------------------------------------------
+    //
+    // The freelancer writes the agreed terms; the client accepts; the order
+    // is created from the offer (see orders/{id}). Figures are frozen at
+    // creation, and the status walks pending → accepted → ordered, with
+    // declined / withdrawn as exits. Rules mirror lib/features/offers/.
+    match /offers/{offerId} {
+      function isOfferParty() {
+        return isSignedIn() && request.auth.uid in resource.data.participantIds;
+      }
+
+      function offeredService() {
+        return get(/databases/$(database)/documents/services/$(request.resource.data.serviceId)).data;
+      }
+
+      function validOfferCreate() {
+        return request.resource.data.keys().hasOnly([
+            'serviceId', 'serviceTitle', 'freelancerId', 'clientId',
+            'participantIds', 'conversationId', 'price', 'currency',
+            'deliveryDays', 'revisionCount', 'scope', 'status',
+            'createdAt', 'updatedAt', 'expiresAt'
+          ])
+          && request.resource.data.freelancerId == request.auth.uid
+          && request.resource.data.clientId is string
+          && request.resource.data.clientId != request.auth.uid
+          && request.resource.data.participantIds.size() == 2
+          && request.resource.data.participantIds.hasAll([
+               request.resource.data.clientId, request.resource.data.freelancerId
+             ])
+          // The card lands in the pair's one conversation; a participant of
+          // that conversation is what the message rule below checks.
+          && request.resource.data.conversationId is string
+          && request.auth.uid in get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data.participantIds
+          && request.resource.data.clientId in get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data.participantIds
+          && offeredService().sellerId == request.auth.uid
+          && offeredService().status == 'published'
+          && request.resource.data.serviceTitle == offeredService().title
+          && request.resource.data.price is int
+          && request.resource.data.price >= 1
+          && request.resource.data.price <= 1000000
+          && request.resource.data.deliveryDays is int
+          && request.resource.data.deliveryDays >= 1
+          && request.resource.data.deliveryDays <= 90
+          && request.resource.data.revisionCount is int
+          && request.resource.data.revisionCount >= 0
+          && request.resource.data.revisionCount <= 10
+          && request.resource.data.scope is string
+          && request.resource.data.scope.size() >= 10
+          && request.resource.data.scope.size() <= 2000
+          && request.resource.data.status == 'pending'
+          && request.resource.data.expiresAt is timestamp;
+      }
+
+      function frozenOfferFields() {
+        return request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'orderId', 'updatedAt']);
+      }
+
+      allow get: if isOfferParty();
+      allow list: if isSignedIn() && request.auth.uid in resource.data.participantIds;
+      allow get, list: if can('orders.manage') || can('reports.view');
+      allow create: if isActive() && validOfferCreate();
+      // The client answers a pending offer. Accepting is only possible while
+      // the offer is still valid: the price a freelancer quoted lapses with
+      // it, and a stale card must not become an order at last month's rate.
+      allow update: if isOfferParty() && frozenOfferFields()
+        && request.auth.uid == resource.data.clientId
+        && resource.data.status == 'pending'
+        && request.resource.data.status in ['accepted', 'declined']
+        && (request.resource.data.status == 'declined'
+            || request.time <= resource.data.expiresAt)
+        && !('orderId' in request.resource.data.diff(resource.data).affectedKeys());
+      // The freelancer takes a pending offer back.
+      allow update: if isOfferParty() && frozenOfferFields()
+        && request.auth.uid == resource.data.freelancerId
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'withdrawn'
+        && !('orderId' in request.resource.data.diff(resource.data).affectedKeys());
+      // The client spends an accepted offer on exactly one order, in the same
+      // batch that creates that order (which must point back here).
+      allow update: if isOfferParty() && frozenOfferFields()
+        && request.auth.uid == resource.data.clientId
+        && resource.data.status == 'accepted'
+        && request.resource.data.status == 'ordered'
+        && request.resource.data.orderId is string
+        && existsAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId))
+        && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.offerId == offerId
+        && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.clientId == request.auth.uid;
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // conversations/{id}/messages/{messageId}
+    // ------------------------------------------------------------------
+    match /conversations/{conversationId} {
+      function isConversationParticipant() {
+        return isSignedIn()
+          && request.auth.uid in resource.data.participantIds;
+      }
+
+      function validConversation() {
+        return request.resource.data.participantIds.hasOnly([request.auth.uid]) == false
+          && request.resource.data.participantIds.size() == 2
+          && request.auth.uid in request.resource.data.participantIds
+          // The update rule pins createdAt; without one here a conversation
+          // would be created that can never accept another message.
+          && 'createdAt' in request.resource.data.keys();
+      }
+
+      // Unread counts live in a map keyed by uid, and nothing previously
+      // stopped one participant writing any number into the other's slot —
+      // enough to fake a permanent badge on someone else's inbox. A write may
+      // only clear your own counter (reading) and raise the other's by at most
+      // one (sending a single message).
+      function validUnreadCounts() {
+        let me = request.auth.uid;
+        let ids = resource.data.participantIds;
+        let other = ids[0] == me ? ids[1] : ids[0];
+        let before = resource.data.get('unreadCount', {});
+        let after = request.resource.data.get('unreadCount', {});
+        return after.get(me, 0) == 0
+          && after.get(other, 0) >= before.get(other, 0)
+          && after.get(other, 0) <= before.get(other, 0) + 1;
+      }
+
+      // Opening a conversation reads it inside a transaction *before* it
+      // exists. `resource` is null then, and `resource.data` on null is an
+      // error, which Firestore reports as permission-denied — so the very
+      // first message to any seller failed. The id is the two uids sorted
+      // and joined, so for a missing document the id itself says who belongs.
+      function idNamesMe() {
+        return conversationId.matches(request.auth.uid + '_.*')
+          || conversationId.matches('.*_' + request.auth.uid);
+      }
+      allow get: if isSignedIn()
+        && ((resource == null && idNamesMe())
+            || (resource != null && request.auth.uid in resource.data.participantIds));
+      allow list: if isSignedIn() && request.auth.uid in resource.data.participantIds;
+      allow create: if isActive() && validConversation()
+        && conversationId == request.resource.data.participantIds[0] + '_'
+                             + request.resource.data.participantIds[1];
+      // Participants may refresh lastMessage metadata but never membership.
+      allow update: if isConversationParticipant()
+        && request.resource.data.participantIds == resource.data.participantIds
+        && request.resource.data.createdAt == resource.data.createdAt
+        && validUnreadCounts();
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function parentAllows() {
+          return isSignedIn()
+            && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds;
+        }
+
+        // A message is text, an attachment, or both — never neither. The
+        // attachment itself lives in Cloud Storage under the conversation's
+        // own path (see storage.rules); the message carries only its
+        // download URL and enough metadata to render a chip.
+        function hasAttachment() {
+          return 'attachmentUrl' in request.resource.data.keys();
+        }
+
+        // Only a Cloud Storage download URL: a message that pointed at an
+        // arbitrary https site would render as a file chip and be a
+        // phishing link wearing the app's clothes.
+        function validAttachment() {
+          return request.resource.data.attachmentUrl is string
+            && request.resource.data.attachmentUrl.size() <= 2048
+            && request.resource.data.attachmentUrl.matches('https://firebasestorage[.]googleapis[.]com/v0/b/.*')
+            && request.resource.data.attachmentName is string
+            && request.resource.data.attachmentName.size() > 0
+            && request.resource.data.attachmentName.size() <= 200
+            && request.resource.data.attachmentType in ['image', 'video', 'file']
+            && request.resource.data.attachmentSize is int
+            && request.resource.data.attachmentSize > 0
+            && request.resource.data.attachmentSize <=
+              (request.resource.data.attachmentType == 'video' ? 25 : 10) * 1024 * 1024;
+        }
+
+        // An offer card: a message that names an offer being created in the
+        // same batch by this sender, for this conversation.
+        function hasOffer() {
+          return 'offerId' in request.resource.data.keys();
+        }
+
+        function validOfferRef() {
+          return request.resource.data.offerId is string
+            && existsAfter(/databases/$(database)/documents/offers/$(request.resource.data.offerId))
+            && getAfter(/databases/$(database)/documents/offers/$(request.resource.data.offerId)).data.freelancerId == request.auth.uid
+            && getAfter(/databases/$(database)/documents/offers/$(request.resource.data.offerId)).data.conversationId == conversationId;
+        }
+
+        function validMessage() {
+          return request.resource.data.keys().hasOnly([
+              'senderId', 'text', 'sentAt', 'offerId', 'serviceId', 'serviceTitle',
+              'attachmentUrl', 'attachmentName', 'attachmentType', 'attachmentSize'
+            ])
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.text is string
+            && request.resource.data.text.size() <= 2000
+            && (request.resource.data.text.size() > 0 || hasAttachment() || hasOffer())
+            && (!hasAttachment() || validAttachment())
+            && (!hasOffer() || validOfferRef())
+            && validServiceRef();
+        }
+
+        function validServiceRef() {
+          let data = request.resource.data;
+          return (!('serviceId' in data.keys()) && !('serviceTitle' in data.keys()))
+            || (data.get('serviceId', '') is string
+                && data.get('serviceId', '').matches('[A-Za-z0-9_-]{1,128}')
+                && data.get('serviceTitle', '') is string
+                && exists(/databases/$(database)/documents/services/$(data.serviceId))
+                && get(/databases/$(database)/documents/services/$(data.serviceId)).data.status == 'published'
+                && get(/databases/$(database)/documents/services/$(data.serviceId)).data.title == data.serviceTitle
+                && get(/databases/$(database)/documents/services/$(data.serviceId)).data.sellerId != request.auth.uid
+                && get(/databases/$(database)/documents/services/$(data.serviceId)).data.sellerId
+                    in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds);
+        }
+
+        allow read: if parentAllows();
+        allow create: if parentAllows() && isActive() && validMessage();
+        // Messages are immutable once sent.
+        allow update, delete: if false;
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // reviews/{orderId}  (document id == order id → one review per order)
+    // ------------------------------------------------------------------
+    match /reviews/{reviewId} {
+      function completedOrder() {
+        return get(/databases/$(database)/documents/orders/$(reviewId)).data;
+      }
+
+      function validReview() {
+        return request.resource.data.orderId == reviewId
+          && request.resource.data.serviceId == completedOrder().serviceId
+          && request.resource.data.reviewerId == request.auth.uid
+          && request.resource.data.reviewerId == completedOrder().clientId
+          && request.resource.data.revieweeId == completedOrder().freelancerId
+          && request.resource.data.rating is int
+          && request.resource.data.rating >= 1
+          && request.resource.data.rating <= 5
+          && request.resource.data.comment is string
+          && request.resource.data.comment.size() > 0
+          && request.resource.data.comment.size() <= 1000;
+      }
+
+      // Reviews of public services are readable by signed-in users.
+      allow read: if isSignedIn();
+      // Only the client of a COMPLETED order may create its review; because
+      // the doc id equals the order id this also blocks duplicates.
+      allow create: if isSignedIn()
+        && completedOrder().status == 'completed'
+        && validReview();
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // payments/{orderId}  (document id == order id → one payment per order)
+    // ------------------------------------------------------------------
+    //
+    // Mirrors lib/features/payments/. The threat model here is money, so the
+    // rules are deliberately stricter than the UI:
+    //
+    //  * amount/commission/netToFreelancer are frozen at creation, exactly as
+    //    the order's price is — a client cannot pay ₱1 for a ₱5000 order, nor
+    //    edit the split afterwards.
+    //  * 'verified' and 'gatewayReference' are SERVER-OWNED. No client may
+    //    ever write them true/non-null. The payments backend uses the Admin
+    //    SDK, which bypasses these rules, so only a trusted server can mark a
+    //    payment gateway-verified.
+    //  * In manual mode only the FREELANCER — the party who receives the
+    //    money — may mark a payment paid. The payer confirming their own
+    //    payment would make the record assert nothing.
+    match /payments/{orderId} {
+      function order() {
+        return get(/databases/$(database)/documents/orders/$(orderId)).data;
+      }
+
+      function isParty() {
+        return isSignedIn()
+          && request.auth.uid in resource.data.participantIds;
+      }
+
+      // Who may see the payment for an order *before* one exists.
+      //
+      // payments/{orderId} is keyed by the order, and until the buyer pays
+      // there is no document — so `resource` is null and reading
+      // `resource.data.participantIds` raises a null error, which Firestore
+      // reports to the client as permission-denied. Both parties therefore
+      // saw "Could not load payment details" on every unpaid order, which is
+      // most of them. The order document is the only thing that can say who
+      // is entitled to the payment that does not exist yet.
+      function isOrderParty() {
+        return isSignedIn()
+          && exists(/databases/$(database)/documents/orders/$(orderId))
+          && request.auth.uid in order().participantIds;
+      }
+
+      function validPaymentCreate() {
+        return request.resource.data.keys().hasOnly([
+          'orderId', 'clientId', 'freelancerId', 'participantIds',
+          'amount', 'currency', 'commission', 'netToFreelancer',
+          'status', 'method', 'verified', 'reference',
+          'gatewayReference', 'createdAt', 'updatedAt', 'paidAt'
+        ])
+        && request.resource.data.keys().hasAll([
+          'orderId', 'clientId', 'freelancerId', 'participantIds',
+          'amount', 'currency', 'commission', 'netToFreelancer',
+          'status', 'method', 'verified'
+        ])
+        && request.resource.data.orderId == orderId
+        // Participants and amount are copied from the trusted order document,
+        // never accepted from the caller's own figures.
+        && request.resource.data.clientId == order().clientId
+         && request.resource.data.freelancerId == order().freelancerId
+         && request.resource.data.amount == order().price
+         && request.resource.data.currency == order().currency
+         && request.resource.data.participantIds == order().participantIds
+        && request.resource.data.amount is int
+        && request.resource.data.amount >= 1
+        && request.resource.data.commission is int
+        && request.resource.data.commission >= 0
+         && request.resource.data.netToFreelancer is int
+         && request.resource.data.netToFreelancer >= 0
+         && validCommissionSplit(
+              request.resource.data.amount,
+              request.resource.data.commission
+            )
+        // The split must reconstitute the gross exactly — no money invented,
+        // none lost, whatever the client-side maths did.
+        && request.resource.data.commission
+             + request.resource.data.netToFreelancer
+           == request.resource.data.amount
+        && request.resource.data.method in ['manual', 'xendit']
+        // A new payment always starts unsettled and unverified.
+        && request.resource.data.status == 'pending'
+        && request.resource.data.verified == false
+        && (!('gatewayReference' in request.resource.data.keys())
+            || request.resource.data.gatewayReference == null
+            || request.resource.data.gatewayReference is string)
+        && (!('reference' in request.resource.data.keys())
+            || (request.resource.data.reference is string
+                 && request.resource.data.reference.size() <= 120));
+      }
+
+      // Mirrors CommissionPolicy.standard / functions/policy.js without
+      // division: the inequalities describe half-up rounding to 5%.
+      function validCommissionSplit(amount, commission) {
+        return commission * 10000 - 5000 <= amount * 500
+          && amount * 500 < commission * 10000 + 5000;
+      }
+
+      // Both parties can see what is owed; nobody else can, apart from staff,
+      // who need the totals to report revenue.
+      //
+      // The two branches are guarded on `resource` rather than combined,
+      // because `&&` short-circuits but an error in either operand of `||`
+      // propagates — so an unguarded `isParty() || isOrderParty()` would
+      // still fail on the missing document it exists to handle.
+      allow get: if can('reports.view') || can('refunds.handle')
+        || can('orders.manage') || can('disputes.resolve')
+        || (resource == null && isOrderParty())
+        || (resource != null && isParty());
+      allow list: if isParty()
+        || can('reports.view') || can('refunds.handle')
+        || can('orders.manage') || can('disputes.resolve');
+
+      // Only the buyer may open a payment, and only for a live order.
+      allow create: if isSignedIn()
+        && request.auth.uid == order().clientId
+        && order().status in ['accepted', 'inProgress', 'submitted',
+                              'revisionRequested']
+        && validPaymentCreate();
+
+      // The client may only re-record reference details while still pending.
+      allow update: if isParty()
+        && resource.data.status == 'pending'
+        && request.auth.uid == resource.data.clientId
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['reference', 'status', 'updatedAt'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.verified == resource.data.verified
+        && request.resource.data.amount == resource.data.amount
+        && request.resource.data.commission == resource.data.commission
+        && request.resource.data.netToFreelancer == resource.data.netToFreelancer;
+
+      // Manual settlement: ONLY the freelancer may confirm receipt, only from
+      // pending, and only on a manual payment. 'verified' stays false — this
+      // is a human attestation, not a gateway receipt, and the app labels it
+      // as such. Gateway payments are settled by the backend's Admin SDK
+      // write, which bypasses rules entirely.
+      allow update: if isParty()
+        && request.auth.uid == resource.data.freelancerId
+        && resource.data.method == 'manual'
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'paid'
+        && request.resource.data.verified == false
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'paidAt', 'updatedAt'])
+        && request.resource.data.amount == resource.data.amount
+        && request.resource.data.commission == resource.data.commission
+        && request.resource.data.netToFreelancer == resource.data.netToFreelancer;
+
+      // Payment history is permanent evidence for disputes.
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // adminActions/{id} - what staff did, and why
+    // ------------------------------------------------------------------
+    //
+    // Kept in its own collection rather than as fields on the order or service
+    // it concerns: those documents are deliberately shape-locked, and an audit
+    // trail that can be edited by the person being audited is not one. Entries
+    // are append-only.
+    match /adminActions/{actionId} {
+      allow read: if can('reports.view');
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'actorId', 'action', 'targetType', 'targetId', 'note', 'createdAt'
+           ])
+        && request.resource.data.actorId == request.auth.uid
+        && request.resource.data.action is string
+        && request.resource.data.action.size() <= 40
+        && request.resource.data.targetId is string
+        && request.resource.data.targetId.size() <= 200
+        && (!('note' in request.resource.data.keys())
+            || (request.resource.data.note is string
+                && request.resource.data.note.size() <= 500));
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // wallets/{uid} - money the platform holds for a freelancer
+    // ------------------------------------------------------------------
+    //
+    // Balances are written ONLY by the backend, alongside a ledger entry,
+    // when an order completes (release) or a payout is requested/settled.
+    // The one thing the owner may write is where to send the money.
+    match /wallets/{uid} {
+      // A typo here sends money to a stranger. GCash and Maya numbers are
+      // 11-digit PH mobiles starting 09; bank accounts are 10 to 16 digits.
+      // Mirrors validAccountNumber() in functions/policy.js.
+      function validPayoutAccount() {
+        let a = request.resource.data.payoutAccount;
+        return a.keys().hasOnly(['type', 'accountName', 'accountNumber', 'bankCode'])
+          && a.type in ['gcash', 'maya', 'bank']
+          // A bank account names its bank as a Xendit channel code, from the
+          // list the app offers (mirrors BANK_CHANNELS in functions/policy.js).
+          && (a.type != 'bank'
+              || a.get('bankCode', '') in [
+                   'PH_BDO', 'PH_BPI', 'PH_METROBANK', 'PH_LANDBANK', 'PH_UNIONBANK',
+                   'PH_SECURITYBANK', 'PH_PNB', 'PH_RCBC', 'PH_CHINABANK', 'PH_EASTWEST'
+                 ])
+          && a.accountName is string
+          && a.accountName.size() > 0
+          && a.accountName.size() <= 80
+          && a.accountNumber is string
+          && ((a.type in ['gcash', 'maya'] && a.accountNumber.matches('09[0-9]{9}'))
+              || (a.type == 'bank' && a.accountNumber.matches('[0-9]{10,16}')));
+      }
+      allow get: if isSelf(uid) || can('payouts.settle') || can('reports.view');
+      allow list: if can('payouts.settle') || can('reports.view');
+      // First write from the owner: only the account, balances absent.
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly(['uid', 'payoutAccount', 'updatedAt'])
+        && request.resource.data.uid == uid
+        && validPayoutAccount();
+      allow update: if isSelf(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['payoutAccount', 'updatedAt'])
+        && validPayoutAccount();
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // ledger/{id} - append-only money movements
+    // ------------------------------------------------------------------
+    match /ledger/{entryId} {
+      allow get, list: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow get, list: if can('payouts.settle') || can('reports.view');
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // payouts/{id} - transfer requests staff settle by hand
+    // ------------------------------------------------------------------
+    match /payouts/{payoutId} {
+      allow get, list: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow get, list: if can('payouts.settle') || can('reports.view');
+      // Requested through the backend, which moves the balance in the same
+      // transaction; settled through the backend, which logs the action.
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // subscriptions/{sessionId} - Pro months, settled by the webhook
+    // ------------------------------------------------------------------
+    match /subscriptions/{subscriptionId} {
+      allow get, list: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow get, list: if can('reports.view');
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // verificationRequests/{uid} - student identity checks
+    // ------------------------------------------------------------------
+    //
+    // The student submits (a school email plus an ID photo uploaded to
+    // Storage under verification/{uid}/); staff decide through the backend,
+    // which also flips identityVerified on the profile. The document id is
+    // the uid, so one student has one open request.
+    match /verificationRequests/{uid} {
+      function validRequest() {
+        return request.resource.data.keys().hasOnly([
+            'uid', 'schoolEmail', 'idImagePath', 'status', 'note',
+            'createdAt', 'updatedAt', 'decidedAt', 'decidedBy'
+          ])
+          && request.resource.data.uid == uid
+          && request.resource.data.status == 'pending'
+          && request.resource.data.schoolEmail is string
+          && request.resource.data.schoolEmail.matches('[^@]+@[^@]+[.][^@]+')
+          && request.resource.data.schoolEmail.size() <= 120
+          && request.resource.data.idImagePath is string
+          && request.resource.data.idImagePath.matches('verification/' + uid + '/.*')
+          && request.resource.data.idImagePath.size() <= 300;
+      }
+      allow get: if isSelf(uid) || can('verification.decide');
+      allow list: if can('verification.decide');
+      allow create: if isSelf(uid) && validRequest();
+      // Re-submission after a rejection; a pending or approved request is
+      // not the student's to change.
+      allow update: if isSelf(uid) && validRequest()
+        && resource.data.status == 'rejected'
+        && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // categories/{id} - the marketplace's category list, staff-managed
+    // ------------------------------------------------------------------
+    //
+    // The app ships with a built-in list (lib/core/constants) and merges
+    // these on top: staff can add, rename, reorder and retire a category
+    // without a release. The id is the categoryId listings carry.
+    match /categories/{categoryId} {
+      function validCategory() {
+        return request.resource.data.keys().hasOnly([
+            'label', 'active', 'sortOrder', 'updatedAt', 'updatedBy'
+          ])
+          && request.resource.data.label is string
+          && request.resource.data.label.size() > 0
+          && request.resource.data.label.size() <= 40
+          && request.resource.data.active is bool
+          && request.resource.data.sortOrder is int
+          && categoryId.matches('[a-z0-9_-]{2,30}');
+      }
+      allow read: if isSignedIn();
+      allow create, update: if can('categories.manage') && validCategory();
+      // Retire, never delete: listings still carry the id.
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // settings/platform - the few switches staff may flip at runtime
+    // ------------------------------------------------------------------
+    match /settings/{settingId} {
+      function validSettings() {
+        return request.resource.data.keys().hasOnly([
+            'announcement', 'announcementExpiresAt', 'ordersPaused', 'updatedAt', 'updatedBy'
+          ])
+          && request.resource.data.get('announcement', '') is string
+          && request.resource.data.get('announcement', '').size() <= 300
+          && request.resource.data.get('ordersPaused', false) is bool
+          && (!('announcementExpiresAt' in request.resource.data.keys())
+              || request.resource.data.announcementExpiresAt is timestamp);
+      }
+      allow read: if isSignedIn();
+      allow write: if settingId == 'platform' && can('settings.manage') && validSettings();
+    }
+
+    // The backend publishes bounded pages of each featured rotation. Clients
+    // can get a selected global/category page but cannot enumerate or rank it.
+    match /featuredRotations/{scopeId} {
+      allow get: if isSignedIn();
+      allow list, write: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // auditLog/{id} - what happened, written only by the backend
+    // ------------------------------------------------------------------
+    //
+    // Sign-ins, profile creation, pricing changes, offers, order moves,
+    // payments, payouts and staff changes land here from Cloud Functions
+    // triggers and routes. No client writes: an audit trail the audited
+    // party can edit is not one.
+    match /auditLog/{entryId} {
+      allow read: if can('reports.view');
+      allow write: if false;
+    }
+
+    // Default deny for everything else.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

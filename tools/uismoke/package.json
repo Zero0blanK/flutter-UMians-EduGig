@@ -1,0 +1,11 @@
+{
+  "name": "student-freelance-ui-smoke",
+  "description": "Drives the built web app in headless Chrome to catch runtime errors and capture screenshots",
+  "private": true,
+  "scripts": {
+    "smoke": "node ui_smoke.js"
+  },
+  "dependencies": {
+    "puppeteer": "^23.0.0"
+  }
+}
