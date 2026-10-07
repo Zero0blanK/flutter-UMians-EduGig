@@ -46,13 +46,14 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Held rather than rebuilt in `build`: a fresh stream object each rebuild
   /// tears down and re-establishes the Firestore listener.
   late final Stream<List<ChatMessage>> _messages;
+  late final List<ChatMessage>? _cachedMessages;
 
   @override
   void initState() {
     super.initState();
-    _messages = context.read<ChatRepository>().watchMessages(
-      widget.conversationId,
-    );
+    final repository = context.read<ChatRepository>();
+    _cachedMessages = repository.cachedMessages(widget.conversationId);
+    _messages = repository.watchMessages(widget.conversationId);
     _inputController.addListener(() {
       final hasText = _inputController.text.trim().isNotEmpty;
       if (hasText != _hasText) setState(() => _hasText = hasText);
@@ -251,6 +252,7 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: StreamBuilder<List<ChatMessage>>(
               stream: _messages,
+              initialData: _cachedMessages,
               builder: (context, snapshot) {
                 if (snapshot.hasError) {
                   return const ErrorView(message: 'Could not load messages.');

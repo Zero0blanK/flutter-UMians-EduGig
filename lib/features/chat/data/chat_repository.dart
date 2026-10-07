@@ -30,10 +30,26 @@ class ChatRepository {
   /// user read per tile per rebuild. Holds the badge too, so a name and its
   /// check mark come from the same read.
   final Map<String, PeerSummary> _peerCache = {};
+  final _messageCache = <String, List<ChatMessage>>{};
+  int _cacheGeneration = 0;
+  static const _cachedConversationLimit = 20;
+
+  List<ChatMessage>? cachedMessages(String conversationId) {
+    final messages = _messageCache.remove(conversationId);
+    if (messages != null) _messageCache[conversationId] = messages;
+    return messages;
+  }
+
+  void clearSessionCache() {
+    _cacheGeneration++;
+    _messageCache.clear();
+    _peerCache.clear();
+  }
 
   Future<String> displayNameOf(String uid) async => (await summaryOf(uid)).name;
 
   Future<PeerSummary> summaryOf(String uid) async {
+    final generation = _cacheGeneration;
     final cached = _peerCache[uid];
     if (cached != null) return cached;
     try {
@@ -45,7 +61,7 @@ class ChatRepository {
               name: data['displayName'] as String? ?? 'Student',
               verified: UserProfile.fromFirestore(doc).hasVerifiedBadge,
             );
-      _peerCache[uid] = summary;
+      if (generation == _cacheGeneration) _peerCache[uid] = summary;
       return summary;
     } on FirebaseException {
       return const PeerSummary(name: 'Student', verified: false);
@@ -125,6 +141,7 @@ class ChatRepository {
     String conversationId, {
     DocumentSnapshot? startAfter,
   }) {
+    final generation = _cacheGeneration;
     Query<Map<String, dynamic>> query = _firestore
         .collection(FirestorePaths.messages(conversationId))
         .orderBy('sentAt', descending: true)
@@ -132,9 +149,17 @@ class ChatRepository {
     if (startAfter != null) {
       query = query.startAfterDocument(startAfter);
     }
-    return query.snapshots().map(
-      (snapshot) => snapshot.docs.map(ChatMessage.fromFirestore).toList(),
-    );
+    return query.snapshots().map((snapshot) {
+      final messages = snapshot.docs.map(ChatMessage.fromFirestore).toList();
+      if (startAfter == null && generation == _cacheGeneration) {
+        _messageCache.remove(conversationId);
+        _messageCache[conversationId] = List.unmodifiable(messages);
+        while (_messageCache.length > _cachedConversationLimit) {
+          _messageCache.remove(_messageCache.keys.first);
+        }
+      }
+      return messages;
+    });
   }
 
   Future<void> sendText({

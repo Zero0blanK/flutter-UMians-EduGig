@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'attachment.dart';
+import 'cached_attachment_image.dart';
 import 'video_attachment_view.dart';
 
 /// Renders images and chat videos inline, with an external file fallback.
@@ -52,8 +53,8 @@ class AttachmentView extends StatelessWidget {
                 minScale: 0.8,
                 maxScale: 4,
                 child: Center(
-                  child: Image.network(
-                    attachment.url,
+                  child: CachedAttachmentImage(
+                    url: attachment.url,
                     fit: BoxFit.contain,
                     errorBuilder: (context, error, stack) => const Icon(
                       Icons.broken_image_outlined,
@@ -99,22 +100,9 @@ class AttachmentView extends StatelessWidget {
           borderRadius: BorderRadius.circular(10),
           child: ConstrainedBox(
             constraints: BoxConstraints(maxHeight: maxImageHeight),
-            child: Image.network(
-              attachment.url,
+            child: CachedAttachmentImage(
+              url: attachment.url,
               fit: BoxFit.cover,
-              loadingBuilder: (context, child, progress) => progress == null
-                  ? child
-                  : SizedBox(
-                      height: 120,
-                      child: Center(
-                        child: CircularProgressIndicator(
-                          value: progress.expectedTotalBytes == null
-                              ? null
-                              : progress.cumulativeBytesLoaded /
-                                    progress.expectedTotalBytes!,
-                        ),
-                      ),
-                    ),
               errorBuilder: (context, error, stack) => _FileChip(
                 attachment: attachment,
                 colour: colour,

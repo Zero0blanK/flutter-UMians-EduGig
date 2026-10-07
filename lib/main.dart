@@ -13,6 +13,7 @@ import 'core/backend/backend_client.dart';
 import 'core/config/app_environment.dart';
 import 'core/platform/platform_repository.dart';
 import 'core/storage/storage_repository.dart';
+import 'core/storage/attachment_image_cache.dart';
 import 'core/widgets/status_views.dart';
 import 'features/auth/data/auth_repository.dart';
 import 'features/admin/data/admin_repository.dart';
@@ -99,12 +100,15 @@ class _ProviderScopeState extends State<ProviderScope> {
   late final PaymentGateway _paymentGateway;
   late final PushService _push;
   late final ThemeController _themeController;
+  late final ChatRepository _chatRepository;
+  String? _chatCacheUid;
 
   @override
   void initState() {
     super.initState();
     final auth = FirebaseAuth.instanceFor(app: widget.app);
     _firestore = FirebaseFirestore.instanceFor(app: widget.app);
+    _chatRepository = ChatRepository(_firestore);
     _storage = StorageRepository(FirebaseStorage.instanceFor(app: widget.app));
 
     _authRepository = AuthRepository(auth, _firestore);
@@ -147,6 +151,11 @@ class _ProviderScopeState extends State<ProviderScope> {
 
   void _syncPushRegistration() {
     final uid = _authController.uid;
+    if (uid != _chatCacheUid) {
+      _chatCacheUid = uid;
+      _chatRepository.clearSessionCache();
+      AttachmentImageCache.shared.clear();
+    }
     if (uid != null) {
       _push.register(uid);
     } else if (_authController.status == AuthStatus.unauthenticated) {
@@ -165,7 +174,7 @@ class _ProviderScopeState extends State<ProviderScope> {
           create: (_) => PlatformSettingsRepository(_firestore),
         ),
         Provider<PushService>.value(value: _push),
-        Provider<ChatRepository>(create: (_) => ChatRepository(_firestore)),
+        Provider<ChatRepository>.value(value: _chatRepository),
         Provider<FeaturedSession>(create: (_) => FeaturedSession()),
         Provider<ServiceRepository>(
           create: (_) => ServiceRepository(_firestore),

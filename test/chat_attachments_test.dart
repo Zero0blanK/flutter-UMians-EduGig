@@ -58,11 +58,15 @@ class _Chat implements ChatRepository {
   Attachment? attachment;
   bool fail = false;
   Completer<void>? gate;
+  List<ChatMessage>? previousMessages;
+  Stream<List<ChatMessage>>? messageUpdates;
+  @override
+  List<ChatMessage>? cachedMessages(String conversationId) => previousMessages;
   @override
   Stream<List<ChatMessage>> watchMessages(
     String conversationId, {
     Object? startAfter,
-  }) => Stream.value([]);
+  }) => messageUpdates ?? Stream.value([]);
   @override
   Future<Conversation?> fetchConversation(String conversationId) async => null;
   @override
@@ -160,9 +164,16 @@ void main() {
   late _Storage storage;
   late _Chat chat;
 
-  Future<void> open(WidgetTester tester, {String? serviceId}) async {
+  Future<void> open(
+    WidgetTester tester, {
+    String? serviceId,
+    List<ChatMessage>? cachedMessages,
+    Stream<List<ChatMessage>>? messageUpdates,
+  }) async {
     storage = _Storage();
-    chat = _Chat();
+    chat = _Chat()
+      ..previousMessages = cachedMessages
+      ..messageUpdates = messageUpdates;
     await tester.pumpWidget(
       MultiProvider(
         providers: [
@@ -177,6 +188,36 @@ void main() {
     );
     await tester.pumpAndSettle();
   }
+
+  testWidgets('cached messages render before the live stream responds', (
+    tester,
+  ) async {
+    final updates = StreamController<List<ChatMessage>>();
+    addTearDown(updates.close);
+    final cached = ChatMessage(
+      id: 'cached',
+      senderId: 'alice',
+      text: 'Already loaded message',
+      sentAt: DateTime(2026),
+    );
+    await open(
+      tester,
+      cachedMessages: [cached],
+      messageUpdates: updates.stream,
+    );
+    expect(find.text('Already loaded message'), findsOneWidget);
+    updates.add([
+      ChatMessage(
+        id: 'live',
+        senderId: 'alice',
+        text: 'New live message',
+        sentAt: DateTime(2026),
+      ),
+    ]);
+    await tester.pumpAndSettle();
+    expect(find.text('New live message'), findsOneWidget);
+    expect(find.text('Already loaded message'), findsNothing);
+  });
 
   Future<void> pick(WidgetTester tester, String? name) async {
     storage.selection = name == null
